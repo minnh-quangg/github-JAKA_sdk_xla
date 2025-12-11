@@ -1,0 +1,137 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import pyrealsense2 as rs
+import math
+
+# aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+
+parameters = aruco.DetectorParameters()
+detector = aruco.ArucoDetector(aruco_dict, parameters)
+marker_length = 0.03  # m
+
+# Chuyển ma trận quay 3x3 -> góc Euler (Rx, Ry, Rz)
+def rotation_matrix_to_euler_xyz(R):
+    if R[2, 0] < -1.0: R[2, 0] = -1.0
+    if R[2, 0] >  1.0: R[2, 0] =  1.0
+    ry = math.asin(-R[2, 0])
+    cy = math.cos(ry)
+    if abs(cy) > 1e-6:
+        rx = math.atan2(R[2, 1], R[2, 2])
+        rz = math.atan2(R[1, 0], R[0, 0])
+    else:
+        rx = math.atan2(-R[1, 2], R[1, 1])
+        rz = 0.0
+    return rx, ry, rz
+
+# Hàm lọc trung vị median (cx,cy) với kxk
+def median_depth_mm(depth_mm, cx, cy, k=5):
+    h, w = depth_mm.shape[:2]
+    r = k // 2
+    x1, y1 = max(cx - r, 0), max(cy - r, 0)
+    x2, y2 = min(cx + r + 1, w), min(cy + r + 1, h)
+    roi = depth_mm[y1:y2, x1:x2]
+    valid = roi[roi > 0]
+    if valid.size == 0:
+        return 0.0
+    return float(np.median(valid))
+
+# Bộ lọc depth value
+class DepthSmoother:
+    def __init__(self, alpha=0.3, max_jump=50):
+        self.alpha = alpha
+        self.max_jump = max_jump
+        self.last_val = 0.0
+
+    def update(self, new_val):
+        if new_val <= 0:
+            return self.last_val
+        if self.last_val == 0:
+            self.last_val = new_val
+        elif abs(new_val - self.last_val) < self.max_jump:  # bỏ outlier
+            self.last_val = (1 - self.alpha) * self.last_val + self.alpha * new_val
+        return self.last_val
+
+pipe = rs.pipeline()
+cfg = rs.config()
+cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+profile = pipe.start(cfg)
+align = rs.align(rs.stream.color)
+
+color_stream = profile.get_stream(rs.stream.color)
+color_intr = color_stream.as_video_stream_profile().get_intrinsics()
+
+fx, fy, cx, cy = color_intr.fx, color_intr.fy, color_intr.ppx, color_intr.ppy
+camera_matrix = np.array([[fx, 0, cx],
+                          [0, fy, cy],
+                          [0, 0, 1]], dtype=np.float32)
+dist_coeffs = np.array(color_intr.coeffs[:5], dtype=np.float32).reshape(-1, 1)
+
+print("Camera matrix:\n", camera_matrix)
+print("Dist coeffs:\n", dist_coeffs.flatten())
+
+smoother = DepthSmoother(alpha=0.25, max_jump=80)  
+
+while True:
+    frames = pipe.wait_for_frames()
+    aligned = align.process(frames)
+    color_frame = aligned.get_color_frame()
+    depth_frame = aligned.get_depth_frame()
+
+    if not color_frame or not depth_frame:
+        continue
+
+    color = np.asanyarray(color_frame.get_data())
+    depth_mm = np.asanyarray(depth_frame.get_data())
+    gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(gray)
+    
+    if ids is not None:
+        aruco.drawDetectedMarkers(color, corners, ids)
+        rvecs, tvecs, _objPoints = aruco.estimatePoseSingleMarkers(
+            corners, marker_length, camera_matrix, dist_coeffs
+        )
+
+        for i, (rvec, tvec, corner) in enumerate(zip(rvecs, tvecs, corners)):
+            cv2.drawFrameAxes(color, camera_matrix, dist_coeffs, rvec, tvec, 0.03)
+
+            # tìm tâm marker
+            pts = corner[0]
+            cx_pix = int(np.mean(pts[:, 0]))
+            cy_pix = int(np.mean(pts[:, 1]))
+
+            # độ sâu trung vị
+            d_mm_raw = median_depth_mm(depth_mm, cx_pix, cy_pix, k=7)
+
+            # smooth theo thời gian
+            d_mm_filt = smoother.update(d_mm_raw)
+            if d_mm_filt <= 0:
+                continue
+
+            # chuyển pixel -> xyz
+            Z_m = d_mm_filt / 1000.0
+            Xc, Yc, Zc = rs.rs2_deproject_pixel_to_point(color_intr, [cx_pix, cy_pix], Z_m)
+            P_cam = np.array([Xc * 1000, Yc * 1000, Zc * 1000])  # mm
+
+            # rvec -> Euler xyz
+            R, _ = cv2.Rodrigues(rvec)
+            rx, ry, rz = rotation_matrix_to_euler_xyz(R)
+            rx_deg, ry_deg, rz_deg = map(math.degrees, [rx, ry, rz])
+
+            marker_id = int(ids[i][0])
+            # print(f"ID {marker_id}: Depth(raw)={d_mm_raw:.1f}  →  Filt={d_mm_filt:.1f} mm")
+            # print(f"Pose: X={P_cam[0]:.1f} Y={P_cam[1]:.1f} Z={P_cam[2]:.1f} | "
+            #       f"Rx={rx_deg:.2f} Ry={ry_deg:.2f} Rz={rz_deg:.2f}")
+
+            # hiển thị
+            text = f"ID:{marker_id} Z={d_mm_filt:.0f}mm"
+            cv2.putText(color, text, (cx_pix - 40, cy_pix - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
+    cv2.imshow("Scence", color)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+pipe.stop()
+cv2.destroyAllWindows()

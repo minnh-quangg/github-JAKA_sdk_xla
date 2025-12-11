@@ -1,0 +1,191 @@
+import cv2
+import numpy as np
+import time
+import math
+import jkrc  # SDK JAKA robot
+
+# === Load thông số camera và Homography (chuẩn cm) ===
+with np.load(r'D:\TT_totnghiep_JAKA\Python\Final_project\camera_calib4.npz') as data:
+    mtx = data['camera_matrix']
+    dist = data['dist_coeff']
+with np.load(r'D:\TT_totnghiep_JAKA\Python\Final_project\homography_matrix4.npz') as data:
+    H = data['H']
+
+
+# ====== LẤY CONTOUR ======
+def get_contours(cam_id=1, stable_duration=5, output_file="contours.txt"):
+    cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        print("❌ Không mở được camera")
+        return []
+
+    last_movement_time = time.time()
+    is_stable = False
+    printed = False
+    prev_gray = None
+    saved_contours = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        h, w = frame.shape[:2]
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
+        frame = cv2.undistort(frame, mtx, dist, None, newcameramtx)
+        # frame = cv2.flip(frame, 1)
+
+        # ROI
+        x1, y1 = int(w * 0.2), int(h * 0.23)
+        x2, y2 = int(w * 0.75), int(h * 0.8)
+        roi_frame = frame[y1:y2, x1:x2]
+
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Phát hiện chuyển động
+        if prev_gray is not None:
+            diff = cv2.absdiff(prev_gray, blur)
+            _, diff_thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            movement_level = np.sum(diff_thresh) / 255
+
+            if movement_level > 500:
+                last_movement_time = time.time()
+                is_stable = False
+                printed = False
+                saved_contours = []
+            else:
+                if time.time() - last_movement_time >= stable_duration:
+                    is_stable = True
+        else:
+            diff_thresh = np.zeros_like(blur)
+
+        # Khi ổn định → lấy contour
+        if is_stable and not printed:
+            _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            with open(output_file, "w") as f:
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area > 100:
+                        cnt_global = cnt + [x1, y1]
+                        np.savetxt(f, cnt_global.reshape(-1, 2), fmt="%d")
+                        f.write("\n")
+                        saved_contours.append(cnt_global)
+
+            print(f"[✅] Đã lưu {len(saved_contours)} contour vào '{output_file}'")
+            printed = True
+            break
+
+        color = (0, 255, 0) if is_stable else (0, 255, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.imshow("Contour Detection", frame)
+        cv2.imshow("Motion", diff_thresh)
+        prev_gray = blur.copy()
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    return saved_contours
+
+
+# ====== PIXEL → ROBOT (dựa trên H, chuyển toàn bộ list contours) ======
+def pixel_to_robot_H_multi(contours, H, scale=10):
+    """
+    Biến đổi toàn bộ danh sách contours từ pixel → world (robot) bằng H.
+    Giả định H đã được tính pixel→world.
+    scale = 10 nếu cần đổi từ cm → mm.
+    đâsd
+    """
+
+    if len(contours) == 0:
+        return []
+
+    # Gom tất cả điểm pixel lại
+    all_points = np.concatenate([cnt.reshape(-1, 2) for cnt in contours], axis=0).astype(np.float32)
+
+    # Chuyển đổi sang hệ robot (thế giới)
+    all_world = cv2.perspectiveTransform(all_points.reshape(-1, 1, 2), H).reshape(-1, 2)
+
+    # Chia lại theo từng contour
+    contours_robot = []
+    idx = 0
+    for cnt in contours:
+        n = cnt.shape[0]
+        contours_robot.append(all_world[idx:idx + n] * scale)  # đổi cm→mm nếu cần
+        idx += n
+
+    return contours_robot
+
+
+# ====== GỬI DỮ LIỆU CHO ROBOT ======
+# def send_to_robot(robot_ip, contours_robot, z_height=1, speed=100, acc=100, tol=0.001):
+def send_to_robot(robot_ip, contours_robot, z_height=10, speed=30, acc=5, tol=0.1):
+    robot = jkrc.RC(robot_ip)
+
+    # === Kết nối robot ===
+    if robot.login()[0] != 0:
+        print("❌ Không thể kết nối robot")
+        return
+    print("✅ Đã kết nối robot!")
+
+    robot.clear_error()
+    robot.power_on()
+    robot.enable_robot()
+    time.sleep(2)
+
+    # === Điểm an toàn ===
+    safe_point = [70, -34, 281,
+                  math.radians(-180), math.radians(0), math.radians(0)]
+
+    print("🔹 Di chuyển đến điểm an toàn khởi tạo...")
+    robot.linear_move_extend(safe_point, 0, False, speed, acc, tol)
+    time.sleep(1)
+
+    print("🟢 Bắt đầu chạy contour...")
+
+    for contour_id, contour in enumerate(contours_robot, start=1):
+        if len(contour) < 2:
+            continue
+
+        print(f"▶ Contour {contour_id} | {len(contour)} điểm")
+
+        # Di chuyển đến điểm đầu tiên
+        x0, y0 = contour[0]
+        start_pos = [x0, y0, z_height + 50, math.radians(180), math.radians(0), math.radians(0)]
+        robot.linear_move_extend(start_pos, 0, False, speed, acc, tol)
+        robot.linear_move_extend([x0, y0, z_height, math.radians(180), 0, 0], 0, False, speed, acc, tol)
+
+        # Di chuyển liên tục theo contour
+        for (x, y) in contour[1:]:
+            robot.linear_move_extend([x, y, z_height, math.radians(180), 0, 0],
+                                     0, False, speed, acc, tol)
+
+        # Nâng lên khi xong contour
+        x_end, y_end = contour[-1]
+        robot.linear_move_extend([x_end, y_end, z_height + 50, math.radians(180), 0, 0],
+                                 0,False, speed, acc, tol)
+
+        print(f"✅ Hoàn tất contour {contour_id}")
+
+    # Trở về điểm an toàn sau khi hoàn tất
+    print("🔹 Trở về safe_point...")
+    robot.linear_move_extend(safe_point, 0, False, speed, acc, tol)
+    print("🏁 Hoàn thành tất cả contour!")
+
+    robot.logout()
+
+
+# ====== MAIN ======
+if __name__ == "__main__":
+    contours = get_contours()
+    if len(contours) == 0:
+        print("❌ Không tìm thấy contour nào!")
+        exit()
+
+    contours_robot = pixel_to_robot_H_multi(contours, H, scale=10)
+    send_to_robot("10.5.5.100", contours_robot)
+    
